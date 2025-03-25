@@ -1,0 +1,3 @@
+*.so
+*.o
+makefile.dep
