@@ -20,8 +20,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define OUT_PATH "./heap-events.%d"
-
 /* Max number of malloc per core */
 #define ARR_SIZE 1000000000
 
@@ -50,8 +48,11 @@ static struct log *log_list;
 static size_t log_index;
 static int __thread _in_trace = 0;
 static char empty_data[32];
+
+#if !defined(PROF) && !defined(PRERUN)
 static uint64_t offload_candidates[max_offload];
 static int offload_count = 0;
+#endif
 
 void __attribute__((constructor)) m_init(void);
 static void *(*_malloc)(size_t);
@@ -65,9 +66,9 @@ struct log {
     uint64_t addr;
     uint64_t size;
     uint64_t entry_type;  // 0 free 1 malloc >=100 mmap
-    uint64_t callchain_size;
+    uint64_t call_stack_size;
     uint64_t digest;
-    void *callchain_strings[10];
+    void *call_stack_strings[10];
 };
 
 #ifdef PRERUN
@@ -75,6 +76,7 @@ struct log {
 struct {
     uint64_t sizes[MAX_CTXS];
     uint64_t digests[MAX_CTXS];
+    void *call_stacks[MAX_CTXS][10];
     size_t index;
 } alloc_ctxs;
 #endif
@@ -103,11 +105,8 @@ struct log *acquire_log() {
 }
 
 int bktrace(size_t *size, void **strings, uint64_t *digest) {
-    if (_in_trace) return 1;
-#ifdef PROF
-    if (!size) return 1;
-    if (!strings) return 1;
-#endif
+    if (_in_trace || !size || !strings) return 1;
+
     _in_trace = 1;
 
     /**
@@ -139,10 +138,8 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
          */
         if (frame->return_address >= 0xffffff || frame->return_address == 0)
             break;
-#ifdef PROF
         strings[i] = (void *)frame->return_address;
         *size = i + 1;
-#endif
         digest_ = digest_ + frame->return_address;
         frame = frame->next_frame;
     }
@@ -167,14 +164,16 @@ extern "C" void *malloc(size_t size) {
             log_item->addr = (uint64_t)addr;
             log_item->size = size;
             log_item->entry_type = 1;
-            bktrace(&log_item->callchain_size, log_item->callchain_strings,
+            bktrace(&log_item->call_stack_size, log_item->call_stack_strings,
                     &log_item->digest);
         }
     }
     return addr;
 #else
     uint64_t digest;
-    if (!_in_trace) bktrace(NULL, NULL, &digest);
+    size_t call_stack_size;
+    void *call_stack[10];
+    if (!_in_trace) bktrace(&call_stack_size, call_stack, &digest);
 #ifdef PRERUN
     const size_t alloc_ctx_index = alloc_ctxs.index;
     bool present = false;
@@ -187,15 +186,17 @@ extern "C" void *malloc(size_t size) {
     if (!present) {
         alloc_ctxs.sizes[alloc_ctx_index] = size;
         alloc_ctxs.digests[alloc_ctx_index] = digest;
+        memcpy(alloc_ctxs.call_stacks[alloc_ctx_index], call_stack,
+               call_stack_size * sizeof(void *));
         alloc_ctxs.index++;
     }
     return _malloc(size);
 #else
-    if ((safe == 1) && is_offload(digest)) {
+    if ((safe == 1) && is_offload(digest))
         return memkind_malloc(MEMKIND_DAX_KMEM, size);
-    } else {
+    else
         return _malloc(size);
-    }
+
 #endif
 #endif
 }
@@ -216,7 +217,7 @@ extern "C" void *calloc(size_t num, size_t size) {
             log_item->addr = (uint64_t)addr;
             log_item->size = num * size;
             log_item->entry_type = 1;
-            bktrace(&log_item->callchain_size, log_item->callchain_strings,
+            bktrace(&log_item->call_stack_size, log_item->call_stack_strings,
                     &(log_item->digest));
         }
     }
@@ -264,7 +265,7 @@ extern "C" void free(void *p) {
             log_item->addr = (uint64_t)p;
             log_item->size = 0;
             log_item->entry_type = 2;
-            bktrace(&log_item->callchain_size, log_item->callchain_strings,
+            bktrace(&log_item->call_stack_size, log_item->call_stack_strings,
                     &log_item->digest);
         }
     }
@@ -283,8 +284,12 @@ extern "C" void free(void *p) {
 
 extern "C" int __attribute__((destructor)) dump_heap_events() {
 #if defined(PROF) || defined(PRERUN)
+    const char *env_out_path = getenv("OUT_PATH");
+    const char *out_path =
+        (env_out_path != NULL) ? env_out_path : "./heap-events.%d";
+
     char buff[125];
-    snprintf(buff, sizeof(buff), OUT_PATH, (int)syscall(186));
+    snprintf(buff, sizeof(buff), out_path, (int)syscall(186));
 
     FILE *dump = fopen(buff, "a+");
     if (!dump) {
@@ -293,36 +298,53 @@ extern "C" int __attribute__((destructor)) dump_heap_events() {
     }
 
 #ifdef PROF
-    fprintf(dump, "rdt\tdigest\tcall_chain\tsize\taddr\tentry_type\n");
+    fprintf(dump, "rdt\tdigest\tcall_stack\tsize\taddr\tentry_type\n");
 
     for (size_t j = 0; j < log_index; ++j) {
         struct log *l = &log_list[j];
 
-        char callchain_buf[1024] = {0};
+        char call_stack_buf[1024] = {0};
         size_t offset = 0;
-        offset += snprintf(callchain_buf + offset,
-                           sizeof(callchain_buf) - offset, "[");
+        offset += snprintf(call_stack_buf + offset,
+                           sizeof(call_stack_buf) - offset, "[");
 
-        for (size_t k = 0; k < l->callchain_size && l->callchain_strings[k];
+        for (size_t k = 0; k < l->call_stack_size && l->call_stack_strings[k];
              ++k) {
-            offset +=
-                snprintf(callchain_buf + offset, sizeof(callchain_buf) - offset,
-                         "%p,", l->callchain_strings[k]);
+            offset += snprintf(call_stack_buf + offset,
+                               sizeof(call_stack_buf) - offset, "%p,",
+                               l->call_stack_strings[k]);
         }
 
-        if (offset > 1 && callchain_buf[offset - 1] == ',')
-            callchain_buf[offset - 1] = ']';
+        if (offset > 1 && call_stack_buf[offset - 1] == ',')
+            call_stack_buf[offset - 1] = ']';
         else
-            strncat(callchain_buf, "]", sizeof(callchain_buf) - offset);
+            strncat(call_stack_buf, "]", sizeof(call_stack_buf) - offset);
 
         fprintf(dump, "%lu\t%lu\t%s\t%d\t%lx\t%d\n", l->rdt, l->digest,
-                callchain_buf, (int)l->size, (unsigned long)l->addr,
+                call_stack_buf, (int)l->size, (unsigned long)l->addr,
                 (int)l->entry_type);
     }
 #else
-    fprintf(dump, "digest,size\n");
+    fprintf(dump, "digest,size,call_stack\n");
     for (size_t i = 0; i < alloc_ctxs.index; i++) {
-        fprintf(dump, "%ld,%ld\n", alloc_ctxs.digests[i], alloc_ctxs.sizes[i]);
+        char call_stack_buf[1024] = {0};
+        size_t offset = 0;
+        offset += snprintf(call_stack_buf + offset,
+                           sizeof(call_stack_buf) - offset, "[");
+
+        for (size_t k = 0; k < 10 && alloc_ctxs.call_stacks[i][k]; ++k) {
+            offset += snprintf(call_stack_buf + offset,
+                               sizeof(call_stack_buf) - offset, "%p;",
+                               alloc_ctxs.call_stacks[i][k]);
+        }
+
+        if (offset > 1 && call_stack_buf[offset - 1] == ';')
+            call_stack_buf[offset - 1] = ']';
+        else
+            strncat(call_stack_buf, "]", sizeof(call_stack_buf) - offset);
+
+        fprintf(dump, "%ld,%ld,%s\n", alloc_ctxs.digests[i],
+                alloc_ctxs.sizes[i], call_stack_buf);
     }
 #endif
     fclose(dump);

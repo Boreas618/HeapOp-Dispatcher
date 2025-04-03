@@ -1,5 +1,5 @@
 CC = g++
-CFLAGS = -Wall -g -ggdb3 -O0 -fPIC
+CFLAGS = -Wall -g -ggdb3 -O0 -fPIC -DPRERUN
 TEST_EXEC_CFLAGS = -no-pie -fno-omit-frame-pointer -g
 LDFLAGS = -ldl -lpthread -lmemkind
 TARGET = ldlib.so
