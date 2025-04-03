@@ -86,6 +86,7 @@ struct stack_frame {
     unsigned long return_address;
 };
 
+#if !defined(PROF) && !defined(PRERUN)
 bool is_offload(uint64_t digest) {
 #pragma GCC unroll max_offload
     for (size_t i = 0; i < max_offload; ++i) {
@@ -94,6 +95,7 @@ bool is_offload(uint64_t digest) {
     }
     return false;
 }
+#endif
 
 struct log *acquire_log() {
     if (!log_list)
@@ -202,8 +204,8 @@ extern "C" void *malloc(size_t size) {
 }
 
 extern "C" void *calloc(size_t num, size_t size) {
-#ifdef PROF
     void *addr;
+#ifdef PROF
     if (!_calloc) {
         memset(empty_data, 0, sizeof(*empty_data));
         addr = empty_data;
@@ -245,7 +247,6 @@ extern "C" void *calloc(size_t num, size_t size) {
         return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
     }
 #endif
-    void *addr;
     if (!_calloc) {
         memset(empty_data, 0, sizeof(*empty_data));
         addr = empty_data;
