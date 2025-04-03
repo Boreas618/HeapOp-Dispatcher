@@ -1,18 +1,28 @@
-CFLAGS=-Wall -g -ggdb3 -O0
-LDFLAGS=-lmemkind
+CC = g++
+CFLAGS = -Wall -g -ggdb3 -O0 -fPIC
+TEST_EXEC_CFLAGS = -no-pie -fno-omit-frame-pointer -g
+LDFLAGS = -ldl -lpthread -lmemkind
+TARGET = ldlib.so
+TEST_EXEC = test_prog
+TEST_SRC = tests/main.c
+DEPS_FILE = makefile.dep
+RESULTS_FILE = heap-events.* *.txt
 
-.PHONY: all clean
-all: makefile.dep ldlib.so test
+.PHONY: all clean test
 
-makefile.dep: *.[Cch]
-	for i in *.[Cc]; do gcc -MM "$${i}" ${CFLAGS}; done > $@
-	
--include makefile.dep
+all: $(DEPS_FILE) $(TARGET) $(TEST_EXEC)
 
-ldlib.so: ldlib.c
-	g++ -fPIC ${CFLAGS} -c ldlib.c
-	g++ -shared -Wl,-soname,libpmalloc.so -o ldlib.so ldlib.o -ldl -lpthread -lmemkind
+$(TARGET): ldlib.o
+	$(CC) -shared -Wl,-soname,libpmalloc.so -o $@ $^ $(LDFLAGS)
+
+ldlib.o: ldlib.cc
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TEST_EXEC): $(TEST_SRC) $(TARGET)
+	$(CC) $(TEST_EXEC_CFLAGS) -o $@ $(TEST_SRC)
+
+test: $(TEST_EXEC)
+	MEMKIND_DAX_KMEM_NODES=1 numactl --cpunodebind=0 env LD_PRELOAD=./$(TARGET) ./$(TEST_EXEC) 2>&1 >> results.txt
 
 clean:
-	rm -f *.o *.so test makefile.dep
-
+	rm -f *.o *.so $(TEST_EXEC) $(DEPS_FILE) $(RESULTS_FILE)

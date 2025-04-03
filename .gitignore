@@ -1,3 +1,6 @@
 *.so
 *.o
 makefile.dep
+.vscode
+test_prog
+heap-events.*

@@ -20,7 +20,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define OUT_PATH "/mnt/sda4/run/redis/heap-events.%d"
+#define OUT_PATH "./heap-events.%d"
 
 /* Max number of malloc per core */
 #define ARR_SIZE 1000000000
@@ -45,15 +45,20 @@
 
 #define get_bp(bp) asm("movq %%rbp, %0" : "=r"(bp) :)
 
+static const int max_offload = 10;
 static struct log *log_list;
 static size_t log_index;
 static int __thread _in_trace = 0;
 static char empty_data[32];
+static uint64_t offload_candidates[max_offload];
+static int offload_count = 0;
 
 void __attribute__((constructor)) m_init(void);
 static void *(*_malloc)(size_t);
 static void *(*_calloc)(size_t, size_t);
 static void (*_free)(void *);
+static int (*main_orig)(int, char **, char **);
+static int safe = 0;
 
 struct log {
     uint64_t rdt;
@@ -65,10 +70,28 @@ struct log {
     void *callchain_strings[10];
 };
 
+#ifdef PRERUN
+#define MAX_CTXS 512
+struct {
+    uint64_t sizes[MAX_CTXS];
+    uint64_t digests[MAX_CTXS];
+    size_t index;
+} alloc_ctxs;
+#endif
+
 struct stack_frame {
     struct stack_frame *next_frame;
     unsigned long return_address;
 };
+
+bool is_offload(uint64_t digest) {
+#pragma GCC unroll max_offload
+    for (size_t i = 0; i < max_offload; ++i) {
+        if (offload_candidates[i] == 0) break;
+        if (offload_candidates[i] == digest) return true;
+    }
+    return false;
+}
 
 struct log *acquire_log() {
     if (!log_list)
@@ -81,8 +104,10 @@ struct log *acquire_log() {
 
 int bktrace(size_t *size, void **strings, uint64_t *digest) {
     if (_in_trace) return 1;
+#ifdef PROF
     if (!size) return 1;
     if (!strings) return 1;
+#endif
     _in_trace = 1;
 
     /**
@@ -114,9 +139,11 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
          */
         if (frame->return_address >= 0xffffff || frame->return_address == 0)
             break;
+#ifdef PROF
         strings[i] = (void *)frame->return_address;
-        digest_ = digest_ + frame->return_address;
         *size = i + 1;
+#endif
+        digest_ = digest_ + frame->return_address;
         frame = frame->next_frame;
     }
 
@@ -131,6 +158,7 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
 
 extern "C" void *malloc(size_t size) {
     if (!_malloc) m_init();
+#ifdef PROF
     void *addr = _malloc(size);
     if (!_in_trace) {
         struct log *log_item = acquire_log();
@@ -144,9 +172,36 @@ extern "C" void *malloc(size_t size) {
         }
     }
     return addr;
+#else
+    uint64_t digest;
+    if (!_in_trace) bktrace(NULL, NULL, &digest);
+#ifdef PRERUN
+    const size_t alloc_ctx_index = alloc_ctxs.index;
+    bool present = false;
+    for (size_t i = 0; i < alloc_ctx_index; ++i) {
+        if (alloc_ctxs.digests[i] == digest) {
+            present = true;
+            break;
+        }
+    }
+    if (!present) {
+        alloc_ctxs.sizes[alloc_ctx_index] = size;
+        alloc_ctxs.digests[alloc_ctx_index] = digest;
+        alloc_ctxs.index++;
+    }
+    return _malloc(size);
+#else
+    if ((safe == 1) && is_offload(digest)) {
+        return memkind_malloc(MEMKIND_DAX_KMEM, size);
+    } else {
+        return _malloc(size);
+    }
+#endif
+#endif
 }
 
 extern "C" void *calloc(size_t num, size_t size) {
+#ifdef PROF
     void *addr;
     if (!_calloc) {
         memset(empty_data, 0, sizeof(*empty_data));
@@ -167,10 +222,41 @@ extern "C" void *calloc(size_t num, size_t size) {
     }
 
     return addr;
+#endif
+    uint64_t digest;
+    if (!_in_trace) bktrace(NULL, NULL, &digest);
+#ifdef PRERUN
+    const size_t alloc_ctx_index = alloc_ctxs.index;
+    bool present = false;
+    for (size_t i = 0; i < alloc_ctx_index; ++i) {
+        if (alloc_ctxs.digests[i] == digest) {
+            present = true;
+            break;
+        }
+    }
+    if (!present) {
+        alloc_ctxs.sizes[alloc_ctx_index] = size;
+        alloc_ctxs.digests[alloc_ctx_index] = digest;
+        alloc_ctxs.index++;
+    }
+#else
+    if (safe == 1) {
+        return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
+    }
+#endif
+    void *addr;
+    if (!_calloc) {
+        memset(empty_data, 0, sizeof(*empty_data));
+        addr = empty_data;
+    } else {
+        addr = _calloc(num, size);
+    }
+    return addr;
 }
 
 extern "C" void free(void *p) {
     if (!_free) m_init();
+#ifdef PROF
     if (!_in_trace && _free) {
         struct log *log_item = acquire_log();
         if (log_item) {
@@ -183,11 +269,22 @@ extern "C" void free(void *p) {
         }
     }
     _free(p);
+#else
+    if (safe == 1) {
+        if (p < sbrk(0))
+            _free(p);
+        else
+            memkind_free(MEMKIND_DAX_KMEM, p);
+    } else {
+        _free(p);
+    }
+#endif
 }
 
-extern "C" int dump_heap_events() {
+extern "C" int __attribute__((destructor)) dump_heap_events() {
+#if defined(PROF) || defined(PRERUN)
     char buff[125];
-    sprintf(buff, OUT_PATH, (int)syscall(186));
+    snprintf(buff, sizeof(buff), OUT_PATH, (int)syscall(186));
 
     FILE *dump = fopen(buff, "a+");
     if (!dump) {
@@ -195,20 +292,41 @@ extern "C" int dump_heap_events() {
         exit(EXIT_FAILURE);
     }
 
+#ifdef PROF
     fprintf(dump, "rdt\tdigest\tcall_chain\tsize\taddr\tentry_type\n");
-    for (size_t j = 0; j < log_index; j++) {
+
+    for (size_t j = 0; j < log_index; ++j) {
         struct log *l = &log_list[j];
-        fprintf(dump, "%lu\t", l->rdt);
-        fprintf(dump, "%lu\t", l->digest);
-        fprintf(dump, "[");
-        for (size_t k = 0; k < l->callchain_size; k++) {
-            if (l->callchain_strings[k] == NULL) break;
-            fprintf(dump, "%p,", l->callchain_strings[k]);
+
+        char callchain_buf[1024] = {0};
+        size_t offset = 0;
+        offset += snprintf(callchain_buf + offset,
+                           sizeof(callchain_buf) - offset, "[");
+
+        for (size_t k = 0; k < l->callchain_size && l->callchain_strings[k];
+             ++k) {
+            offset +=
+                snprintf(callchain_buf + offset, sizeof(callchain_buf) - offset,
+                         "%p,", l->callchain_strings[k]);
         }
-        fprintf(dump, "]\t");
-        fprintf(dump, "%d\t%lx\t%d\n", (int)l->size, (long unsigned)l->addr,
+
+        if (offset > 1 && callchain_buf[offset - 1] == ',')
+            callchain_buf[offset - 1] = ']';
+        else
+            strncat(callchain_buf, "]", sizeof(callchain_buf) - offset);
+
+        fprintf(dump, "%lu\t%lu\t%s\t%d\t%lx\t%d\n", l->rdt, l->digest,
+                callchain_buf, (int)l->size, (unsigned long)l->addr,
                 (int)l->entry_type);
     }
+#else
+    fprintf(dump, "digest,size\n");
+    for (size_t i = 0; i < alloc_ctxs.index; i++) {
+        fprintf(dump, "%ld,%ld\n", alloc_ctxs.digests[i], alloc_ctxs.sizes[i]);
+    }
+#endif
+    fclose(dump);
+#endif
     return 0;
 }
 
@@ -216,4 +334,39 @@ void __attribute__((constructor)) m_init(void) {
     _malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, "malloc");
     _calloc = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
     _free = (void (*)(void *))dlsym(RTLD_NEXT, "free");
+
+#if !defined(PROF) && !defined(PRERUN)
+    const char *env_name = "OFFLOAD_CANDIDATES";
+    char *env = getenv(env_name);
+    if (env == NULL) return;
+
+    char *input = strdup(env);
+    if (input == NULL) return;
+
+    char *token = strtok(input, ",");
+    while (token != NULL && offload_count < max_offload) {
+        offload_candidates[offload_count++] = atoi(token);
+        token = strtok(NULL, ",");
+    }
+    _free(input);
+#endif
+}
+
+int main_hook(int argc, char **argv, char **envp) {
+    safe = 1;
+    int ret = main_orig(argc, argv, envp);
+    return ret;
+}
+
+extern "C" int __libc_start_main(int (*main)(int, char **, char **), int argc,
+                                 char **argv,
+                                 int (*init)(int, char **, char **),
+                                 void (*fini)(void), void (*rtld_fini)(void),
+                                 void *stack_end) {
+    main_orig = main;
+    typeof(&__libc_start_main) orig =
+        (int (*)(int (*)(int, char **, char **), int, char **,
+                 int (*)(int, char **, char **), void (*)(), void (*)(),
+                 void *))dlsym(RTLD_NEXT, "__libc_start_main");
+    return orig(main_hook, argc, argv, init, fini, rtld_fini, stack_end);
 }
