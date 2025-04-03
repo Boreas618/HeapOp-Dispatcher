@@ -72,7 +72,7 @@ struct log {
 };
 
 #ifdef PRERUN
-#define MAX_CTXS 512
+#define MAX_CTXS 2048
 struct {
     uint64_t sizes[MAX_CTXS];
     uint64_t digests[MAX_CTXS];
@@ -174,7 +174,7 @@ extern "C" void *malloc(size_t size) {
 #else
     uint64_t digest;
     size_t call_stack_size;
-    void *call_stack[10];
+    void *call_stack[CALLCHAIN_SIZE];
     if (!_in_trace) bktrace(&call_stack_size, call_stack, &digest);
 #ifdef PRERUN
     const size_t alloc_ctx_index = alloc_ctxs.index;
@@ -227,7 +227,9 @@ extern "C" void *calloc(size_t num, size_t size) {
     return addr;
 #endif
     uint64_t digest;
-    if (!_in_trace) bktrace(NULL, NULL, &digest);
+    size_t call_stack_size;
+    void *call_stack[CALLCHAIN_SIZE];
+    if (!_in_trace) bktrace(&call_stack_size, call_stack, &digest);
 #ifdef PRERUN
     const size_t alloc_ctx_index = alloc_ctxs.index;
     bool present = false;
@@ -240,6 +242,10 @@ extern "C" void *calloc(size_t num, size_t size) {
     if (!present) {
         alloc_ctxs.sizes[alloc_ctx_index] = size;
         alloc_ctxs.digests[alloc_ctx_index] = digest;
+        if (safe == 1) {
+            memcpy(alloc_ctxs.call_stacks[alloc_ctx_index], call_stack,
+                   call_stack_size * sizeof(void *));
+        }
         alloc_ctxs.index++;
     }
 #else
