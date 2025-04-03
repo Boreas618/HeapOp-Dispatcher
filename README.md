@@ -2,7 +2,7 @@
 
 **HeapOp-Dispatcher** is a dynamic heap operation interceptor that overloads standard heap-related functions (e.g., `malloc`) and dispatches them to alternate implementations. For example, memory can be allocated on a remote NUMA node using `memkind_malloc` instead of the default local heap.
 
-**HeapOp-Dispatcher** is adapted from [Memprof Library](https://github.com/Memprof/library)
+**HeapOp-Dispatcher** is adapted from [Memprof Library](https://github.com/Memprof/library).
 
 ## Features
 
