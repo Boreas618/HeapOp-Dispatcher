@@ -37,3 +37,6 @@ export OFFLOAD_CANDIDATES=12345,6789
 ```
 
 Here, `OFFLOAD_CANDIDATES` is a comma-separated list of digests (collected during `PRERUN`) representing call sites to be redirected to remote allocation.
+
+### Redis Support
+Redis uses a hack to determine the size of the allocated heap memory, which is incompatible with the memkind implementation. Therefore, if you want to use this tool with Redis, it is recommended to use [this fork of Redis](https://github.com/Boreas618/redis).
