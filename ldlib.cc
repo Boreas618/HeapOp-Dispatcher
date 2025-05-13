@@ -53,6 +53,8 @@ static char empty_data[32];
 #if !defined(PROF) && !defined(PRERUN)
 static uint64_t offload_candidates[max_offload];
 static int offload_count = 0;
+
+// FIXME: each candidate should correspond to an offload_ratio.
 static uint64_t offload_ratio = 0;
 #endif
 
