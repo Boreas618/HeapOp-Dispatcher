@@ -262,7 +262,7 @@ extern "C" void *calloc(size_t num, size_t size) {
         alloc_ctxs.index++;
     }
 #else
-    static int index = 0;
+    static uint64_t index = 0;
     if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio)) {
         return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
     }
@@ -413,7 +413,7 @@ void __attribute__((constructor)) m_init(void) {
 
     offload_ratio = atoi(input_2);
     if (offload_ratio < 0) {
-        fprintf(stderr, "error: invalid offload_ratio %d.\n", offload_ratio);
+        fprintf(stderr, "error: invalid offload_ratio %ld.\n", offload_ratio);
         goto err;
     }
 
