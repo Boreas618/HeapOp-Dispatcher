@@ -1,5 +1,5 @@
 CC = g++
-MODE ?= PRERUN
+MODE ?= DEFAULT
 
 ifeq ($(MODE),PRERUN)
   CFLAGS_MODE = -DPRERUN

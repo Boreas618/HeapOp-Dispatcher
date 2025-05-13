@@ -1,3 +1,4 @@
+#define DEFAULT
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -52,6 +53,7 @@ static char empty_data[32];
 #if !defined(PROF) && !defined(PRERUN)
 static uint64_t offload_candidates[max_offload];
 static int offload_count = 0;
+static int offload_ratio = 0;
 #endif
 
 void __attribute__((constructor)) m_init(void);
@@ -72,9 +74,9 @@ struct log {
 };
 
 #ifdef PRERUN
-#define MAX_CTXS 2048
+#define MAX_CTXS 4096
 struct {
-    uint64_t sizes[MAX_CTXS];
+    uint64_t counts[MAX_CTXS];
     uint64_t digests[MAX_CTXS];
     void *call_stacks[MAX_CTXS][10];
     size_t index;
@@ -83,7 +85,7 @@ struct {
 
 struct stack_frame {
     struct stack_frame *next_frame;
-    unsigned long return_address;
+    uint64_t return_address;
 };
 
 #if !defined(PROF) && !defined(PRERUN)
@@ -119,6 +121,7 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
 
 #if USE_FRAME_POINTER
     struct stack_frame *frame;
+    uint64_t first_retaddr;
 
     /**
      * Note that we assume the application is compiled with -no-pie. Therefore,
@@ -132,14 +135,17 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
      * area.
      */
     frame = frame->next_frame;
+    first_retaddr = frame->return_address;
 
     for (int i = 0; i < CALLCHAIN_SIZE; i++) {
         if (!frame) break;
-        /**
-         * We only capture call chain in the text section.
-         */
+
+        // We only capture call chain in the text section.
         if (frame->return_address >= 0xffffff || frame->return_address == 0)
             break;
+
+        if ((i > 0) && (frame->return_address == first_retaddr)) break;
+
         strings[i] = (void *)frame->return_address;
         *size = i + 1;
         digest_ = digest_ + frame->return_address;
@@ -175,18 +181,21 @@ extern "C" void *malloc(size_t size) {
     uint64_t digest;
     size_t call_stack_size;
     void *call_stack[CALLCHAIN_SIZE];
+    memset(call_stack, 0, CALLCHAIN_SIZE * sizeof(void *));
     if (!_in_trace) bktrace(&call_stack_size, call_stack, &digest);
+
 #ifdef PRERUN
     const size_t alloc_ctx_index = alloc_ctxs.index;
     bool present = false;
     for (size_t i = 0; i < alloc_ctx_index; ++i) {
         if (alloc_ctxs.digests[i] == digest) {
             present = true;
+            alloc_ctxs.counts[i]++;
             break;
         }
     }
     if (!present) {
-        alloc_ctxs.sizes[alloc_ctx_index] = size;
+        alloc_ctxs.counts[alloc_ctx_index] = 1;
         alloc_ctxs.digests[alloc_ctx_index] = digest;
         memcpy(alloc_ctxs.call_stacks[alloc_ctx_index], call_stack,
                call_stack_size * sizeof(void *));
@@ -194,7 +203,8 @@ extern "C" void *malloc(size_t size) {
     }
     return _malloc(size);
 #else
-    if ((safe == 1) && is_offload(digest))
+    static uint64_t index = 0;
+    if ((safe == 1) && is_offload(digest) && ((index++) % 100 <= offload_ratio))
         return memkind_malloc(MEMKIND_DAX_KMEM, size);
     else
         return _malloc(size);
@@ -225,10 +235,11 @@ extern "C" void *calloc(size_t num, size_t size) {
     }
 
     return addr;
-#endif
+#else
     uint64_t digest;
     size_t call_stack_size;
     void *call_stack[CALLCHAIN_SIZE];
+    memset(call_stack, 0, CALLCHAIN_SIZE * sizeof(void *));
     if (!_in_trace) bktrace(&call_stack_size, call_stack, &digest);
 #ifdef PRERUN
     const size_t alloc_ctx_index = alloc_ctxs.index;
@@ -240,7 +251,7 @@ extern "C" void *calloc(size_t num, size_t size) {
         }
     }
     if (!present) {
-        alloc_ctxs.sizes[alloc_ctx_index] = size;
+        alloc_ctxs.counts[alloc_ctx_index] = 1;
         alloc_ctxs.digests[alloc_ctx_index] = digest;
         if (safe == 1) {
             memcpy(alloc_ctxs.call_stacks[alloc_ctx_index], call_stack,
@@ -249,7 +260,9 @@ extern "C" void *calloc(size_t num, size_t size) {
         alloc_ctxs.index++;
     }
 #else
-    if (safe == 1) {
+    static int index = 0;
+    if ((safe == 1) && is_offload(digest) &&
+        ((index++) % 100 <= offload_ratio)) {
         return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
     }
 #endif
@@ -260,6 +273,7 @@ extern "C" void *calloc(size_t num, size_t size) {
         addr = _calloc(num, size);
     }
     return addr;
+#endif
 }
 
 extern "C" void free(void *p) {
@@ -289,7 +303,7 @@ extern "C" void free(void *p) {
 #endif
 }
 
-extern "C" int __attribute__((destructor)) dump_heap_events() {
+extern "C" __attribute__((destructor)) int dump_heap_events() {
 #if defined(PROF) || defined(PRERUN)
     const char *env_out_path = getenv("OUT_PATH");
     const char *out_path =
@@ -332,14 +346,15 @@ extern "C" int __attribute__((destructor)) dump_heap_events() {
                 (int)l->entry_type);
     }
 #else
-    fprintf(dump, "digest,size,call_stack\n");
+    fprintf(dump, "digest,count,call_stack\n");
     for (size_t i = 0; i < alloc_ctxs.index; i++) {
         char call_stack_buf[1024] = {0};
         size_t offset = 0;
         offset += snprintf(call_stack_buf + offset,
                            sizeof(call_stack_buf) - offset, "[");
 
-        for (size_t k = 0; k < 10 && alloc_ctxs.call_stacks[i][k]; ++k) {
+        for (size_t k = 0; k < CALLCHAIN_SIZE && alloc_ctxs.call_stacks[i][k];
+             ++k) {
             offset += snprintf(call_stack_buf + offset,
                                sizeof(call_stack_buf) - offset, "%p;",
                                alloc_ctxs.call_stacks[i][k]);
@@ -351,7 +366,7 @@ extern "C" int __attribute__((destructor)) dump_heap_events() {
             strncat(call_stack_buf, "]", sizeof(call_stack_buf) - offset);
 
         fprintf(dump, "%ld,%ld,%s\n", alloc_ctxs.digests[i],
-                alloc_ctxs.sizes[i], call_stack_buf);
+                alloc_ctxs.counts[i], call_stack_buf);
     }
 #endif
     fclose(dump);
@@ -365,19 +380,47 @@ void __attribute__((constructor)) m_init(void) {
     _free = (void (*)(void *))dlsym(RTLD_NEXT, "free");
 
 #if !defined(PROF) && !defined(PRERUN)
-    const char *env_name = "OFFLOAD_CANDIDATES";
-    char *env = getenv(env_name);
-    if (env == NULL) return;
+    char *env_1, *env_2, *input_1, *input_2, *token;
 
-    char *input = strdup(env);
-    if (input == NULL) return;
+    const char *env_name_1 = "OFFLOAD_CANDIDATES";
+    const char *env_name_2 = "OFFLOAD_RATIO";
 
-    char *token = strtok(input, ",");
+    env_1 = getenv(env_name_1);
+    if (env_1 == NULL) {
+        fprintf(stderr, "error: %s not found\n", env_name_1);
+        goto err;
+    }
+
+    env_2 = getenv(env_name_2);
+    if (env_2 == NULL) {
+        fprintf(stderr, "error: %s not found\n", env_name_2);
+        goto err;
+    }
+
+    input_1 = strdup(env_1);
+    input_2 = strdup(env_2);
+    if (input_1 == NULL || input_2 == NULL) {
+        fprintf(stderr, "error: failed to duplicate\n");
+        goto err;
+    }
+
+    token = strtok(input_1, ",");
     while (token != NULL && offload_count < max_offload) {
         offload_candidates[offload_count++] = atoi(token);
         token = strtok(NULL, ",");
     }
-    _free(input);
+
+    offload_ratio = atoi(input_2);
+    if (offload_ratio < 0 || offload_ratio > 100) {
+        fprintf(stderr, "error: invalid offload_ratio %d.\n", offload_ratio);
+        goto err;
+    }
+
+    return;
+
+err:
+    if (input_1) _free(input_1);
+    if (input_2) _free(input_2);
 #endif
 }
 
