@@ -53,7 +53,7 @@ static char empty_data[32];
 #if !defined(PROF) && !defined(PRERUN)
 static uint64_t offload_candidates[max_offload];
 static int offload_count = 0;
-static int offload_ratio = 0;
+static uint64_t offload_ratio = 0;
 #endif
 
 void __attribute__((constructor)) m_init(void);
@@ -204,7 +204,7 @@ extern "C" void *malloc(size_t size) {
     return _malloc(size);
 #else
     static uint64_t index = 0;
-    if ((safe == 1) && is_offload(digest) && ((index++) % 100 <= offload_ratio))
+    if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio))
         return memkind_malloc(MEMKIND_DAX_KMEM, size);
     else
         return _malloc(size);
@@ -261,8 +261,7 @@ extern "C" void *calloc(size_t num, size_t size) {
     }
 #else
     static int index = 0;
-    if ((safe == 1) && is_offload(digest) &&
-        ((index++) % 100 <= offload_ratio)) {
+    if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio)) {
         return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
     }
 #endif
@@ -411,7 +410,7 @@ void __attribute__((constructor)) m_init(void) {
     }
 
     offload_ratio = atoi(input_2);
-    if (offload_ratio < 0 || offload_ratio > 100) {
+    if (offload_ratio < 0) {
         fprintf(stderr, "error: invalid offload_ratio %d.\n", offload_ratio);
         goto err;
     }
