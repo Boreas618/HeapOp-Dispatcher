@@ -21,28 +21,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* Max number of malloc per core */
-#define ARR_SIZE 1000000000
-
-/* Use Frame Pointers to compute the stack trace (faster) */
-#define USE_FRAME_POINTER 1
-
-/* Stack trace length */
-#define CALLCHAIN_SIZE 32
-
-#ifdef __x86_64__
-#define rdtscll(val)                                                 \
-    {                                                                \
-        unsigned int __a, __d;                                       \
-        asm volatile("rdtsc" : "=a"(__a), "=d"(__d));                \
-        (val) = ((unsigned long)__a) | (((unsigned long)__d) << 32); \
-    }
-
-#else
-#define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A"(val))
-#endif
-
-#define get_bp(bp) asm("movq %%rbp, %0" : "=r"(bp) :)
+#include "utils.h"
+#include "ldlib.h"
 
 static const int max_offload = 10;
 static struct log *log_list;
@@ -50,45 +30,26 @@ static size_t log_index;
 static int __thread _in_trace = 0;
 static char empty_data[32];
 
-#if !defined(PROF) && !defined(PRERUN)
-static uint64_t offload_candidates[max_offload];
-static int offload_count = 0;
-
-// FIXME: each candidate should correspond to an offload_ratio.
-static uint64_t offload_ratio = 0;
-#endif
-
-void __attribute__((constructor)) m_init(void);
+static void __attribute__((constructor)) m_init(void);
 static void *(*_malloc)(size_t);
 static void *(*_calloc)(size_t, size_t);
 static void (*_free)(void *);
 static int (*main_orig)(int, char **, char **);
-static int safe = 0;
 
-struct log {
-    uint64_t rdt;
-    uint64_t addr;
-    uint64_t size;
-    uint64_t entry_type;  // 0 free 1 malloc >=100 mmap
-    uint64_t call_stack_size;
-    uint64_t digest;
-    void *call_stack_strings[10];
-};
-
-#ifdef PRERUN
-#define MAX_CTXS 4096
-struct {
-    uint64_t counts[MAX_CTXS];
-    uint64_t digests[MAX_CTXS];
-    void *call_stacks[MAX_CTXS][10];
-    size_t index;
-} alloc_ctxs;
+#if !defined(PROF) && !defined(PRERUN)
+static uint64_t offload_candidates[max_offload];
+static int offload_count = 0;
+static uint64_t offload_ratio = 0; // FIXME: each candidate should correspond to an offload_ratio.
 #endif
 
-struct stack_frame {
-    struct stack_frame *next_frame;
-    uint64_t return_address;
-};
+static uint64_t remote_start = UINT64_MAX;
+static uint64_t remote_end = 0;
+static int safe = 0;
+
+inline void update_remote_range(uint64_t addr, size_t size) {
+    remote_start = MIN(remote_start, addr);
+    remote_end = MAX(remote_end, addr + size);
+}
 
 #if !defined(PROF) && !defined(PRERUN)
 bool is_offload(uint64_t digest) {
@@ -123,7 +84,7 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
 
 #if USE_FRAME_POINTER
     struct stack_frame *frame;
-    uint64_t first_retaddr;
+    // uint64_t first_retaddr;
 
     /**
      * Note that we assume the application is compiled with -no-pie. Therefore,
@@ -137,7 +98,7 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
      * area.
      */
     frame = frame->next_frame;
-    first_retaddr = frame->return_address;
+    // first_retaddr = frame->return_address;
 
     for (int i = 0; i < CALLCHAIN_SIZE; i++) {
         if (!frame) break;
@@ -146,7 +107,7 @@ int bktrace(size_t *size, void **strings, uint64_t *digest) {
         if (frame->return_address >= 0xffffff || frame->return_address == 0)
             break;
 
-        if ((i > 0) && (frame->return_address == first_retaddr)) break;
+        // if ((i > 0) && (frame->return_address == first_retaddr)) break;
 
         strings[i] = (void *)frame->return_address;
         *size = i + 1;
@@ -206,11 +167,14 @@ extern "C" void *malloc(size_t size) {
     return _malloc(size);
 #else
     static uint64_t index = 0;
-    if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio))
-        return memkind_malloc(MEMKIND_DAX_KMEM, size);
-    else
+    if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio)) {
+        void *addr = memkind_malloc(MEMKIND_DAX_KMEM, size);
+        update_remote_range((uint64_t)addr, size);
+        return addr;
+    }
+    else {
         return _malloc(size);
-
+    }
 #endif
 #endif
 }
@@ -264,7 +228,9 @@ extern "C" void *calloc(size_t num, size_t size) {
 #else
     static uint64_t index = 0;
     if ((safe == 1) && is_offload(digest) && (index++ <= offload_ratio)) {
-        return memkind_calloc(MEMKIND_DAX_KMEM, num, size);
+        void *addr = memkind_calloc(MEMKIND_DAX_KMEM, num, size);
+        update_remote_range((uint64_t)addr, size * num);
+        return addr;
     }
 #endif
     if (!_calloc) {
@@ -293,14 +259,8 @@ extern "C" void free(void *p) {
     }
     _free(p);
 #else
-    if (safe == 1) {
-        if (p < sbrk(0))
-            _free(p);
-        else
-            memkind_free(MEMKIND_DAX_KMEM, p);
-    } else {
-        _free(p);
-    }
+    if (safe == 1 && (uint64_t)p >= remote_start && (uint64_t)p <= remote_end) memkind_free(MEMKIND_DAX_KMEM, p);
+    else _free(p);
 #endif
 }
 
